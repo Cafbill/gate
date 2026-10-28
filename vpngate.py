@@ -16,6 +16,9 @@ import io
 import json
 import os
 import re
+import socket
+import ssl
+import struct
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -305,12 +308,11 @@ EDGE_HOSTS = [
 
 NODES_URL = os.environ.get("NODES_URL", "https://cafbill.github.io/gate/nodes.txt")
 
-def build_nodes_text(data):
-    """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
+def iter_node_lines(data):
+    """按发布顺序产出 (line, entry, node)"""
     countries = data["countries"]
     _entry = os.environ.get("HOSTS_ENTRY", "").strip()
     edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
-    lines = []
     idx = 0
     ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
     for cname, grp in ordered:
@@ -322,12 +324,16 @@ def build_nodes_text(data):
         for i, n in enumerate(res_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
+            yield (f"{entry}#{zh}-住宅-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}", entry, n)
         for i, n in enumerate(dc_nodes, 1):
             entry = edge[idx % len(edge)]
             idx += 1
-            lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
-    return "\n".join(lines) + "\n"
+            yield (f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}", entry, n)
+
+
+def build_nodes_text(data):
+    """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
+    return "\n".join(line for line, _entry, _node in iter_node_lines(data)) + "\n"
 
 def write_outputs(data):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
@@ -351,6 +357,201 @@ def write_outputs(data):
         f.write(build_nodes_text(data))
 
     return data_path, html_path, nodes_path
+
+# ---------------------------------------------------------------------------
+# 端到端拨测 (VLESS over WS -> Worker -> SSTP -> 204)
+# ---------------------------------------------------------------------------
+PROBE_ENABLE = os.environ.get("PROBE_ENABLE", "1").strip().lower() not in ("0", "false", "no", "off")
+PROBE_UUID = os.environ.get("PROBE_UUID", "").strip()
+PROBE_TIMEOUT = float(os.environ.get("PROBE_TIMEOUT", "8"))
+PROBE_CONCURRENCY = max(1, int(os.environ.get("PROBE_CONCURRENCY", "10")))
+PROBE_TARGET_HOST = os.environ.get("PROBE_TARGET_HOST", "cp.cloudflare.com")
+PROBE_TARGET_PORT = int(os.environ.get("PROBE_TARGET_PORT", "80"))
+PROBE_TARGET_PATH = os.environ.get("PROBE_TARGET_PATH", "/generate_204")
+PROBE_HOST = os.environ.get("PROBE_HOST", "").strip()
+
+
+def _chain_path(exit_host, exit_port):
+    """按 edgetunnel base64SecretEncode 规则生成链式代理路径"""
+    payload = json.dumps(
+        {"type": "sstp", "username": "vpn", "password": "vpn", "hostname": exit_host, "port": int(exit_port)},
+        separators=(",", ":"),
+    ).encode()
+    key = PROBE_UUID.encode()
+    mixed = bytes(b ^ key[i % len(key)] for i, b in enumerate(payload))
+    return "/video/" + base64.b64encode(mixed).decode()
+
+
+def _split_entry(entry):
+    entry = (entry or "").strip()
+    if entry.startswith("["):
+        host, port = entry[1:].split("]:", 1)
+        return host, int(port)
+    if entry.count(":") == 1:
+        host, port = entry.split(":", 1)
+        return host, int(port)
+    return entry, 443
+
+
+def _ws_frame(payload):
+    n = len(payload)
+    mask = os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    if n < 126:
+        head = bytes([0x82, 0x80 | n])
+    elif n < 65536:
+        head = bytes([0x82, 0x80 | 126]) + struct.pack(">H", n)
+    else:
+        head = bytes([0x82, 0x80 | 127]) + struct.pack(">Q", n)
+    return head + mask + masked
+
+
+def _ws_read(ws, budget):
+    """读一帧, 返回 (opcode, data)"""
+    h = ws.recv(2)
+    if len(h) < 2:
+        return None, b""
+    opcode = h[0] & 0x0F
+    ln = h[1] & 0x7F
+    if ln == 126:
+        ln = struct.unpack(">H", ws.recv(2))[0]
+    elif ln == 127:
+        ln = struct.unpack(">Q", ws.recv(8))[0]
+    chunk = b""
+    while len(chunk) < ln:
+        part = ws.recv(min(ln - len(chunk), 16384))
+        if not part:
+            break
+        chunk += part
+    return opcode, chunk
+
+
+def _probe_one(entry, exit_host, exit_port, timeout=None):
+    """拨测单个节点: 返回 (ok, latency_ms, error)"""
+    timeout = PROBE_TIMEOUT if timeout is None else timeout
+    entry_host, entry_port = _split_entry(entry)
+    # Cloudflare 按 SNI 路由到 Worker: SNI/Host 必须是 Worker 域名, 而连接落在优选入口 IP 上
+    sni = PROBE_HOST or entry_host
+    path = _chain_path(exit_host, exit_port)
+    http_req = (
+        f"GET {PROBE_TARGET_PATH} HTTP/1.1\r\nHost: {PROBE_TARGET_HOST}\r\n"
+        "Connection: close\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
+    ).encode()
+    try:
+        ips = sorted({ai[4][0] for ai in socket.getaddrinfo(entry_host, entry_port, type=socket.SOCK_STREAM)})
+    except Exception as exc:
+        return False, 0, f"dns:{type(exc).__name__}"
+    if not ips:
+        return False, 0, "dns:empty"
+
+    last_err = "unknown"
+    for ip in ips[:3]:
+        sock = socket.socket(socket.AF_INET6 if ":" in ip else socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(timeout)
+        t0 = time.time()
+        try:
+            sock.connect((ip, entry_port))
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            ctx.set_alpn_protocols(["http/1.1"])
+            ws = ctx.wrap_socket(sock, server_hostname=sni)
+            key = base64.b64encode(os.urandom(16)).decode()
+            hs = (
+                f"GET {path} HTTP/1.1\r\nHost: {sni}\r\nUpgrade: websocket\r\n"
+                f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\n"
+                "Sec-WebSocket-Version: 13\r\nUser-Agent: Mozilla/5.0\r\n\r\n"
+            )
+            ws.sendall(hs.encode())
+            buf = b""
+            while b"\r\n\r\n" not in buf:
+                chunk = ws.recv(4096)
+                if not chunk:
+                    break
+                buf += chunk
+            if b" 101" not in buf.split(b"\r\n")[0]:
+                last_err = f"ws:{buf.split(b'\r\n')[0][:40].decode('latin1', 'replace')}"
+                continue
+            t_ws = time.time() - t0
+            header = (
+                b"\x00" + bytes.fromhex(PROBE_UUID.replace("-", "")) + b"\x00\x01"
+                + struct.pack(">H", PROBE_TARGET_PORT) + b"\x02"
+                + bytes([len(PROBE_TARGET_HOST)]) + PROBE_TARGET_HOST.encode() + http_req
+            )
+            ws.sendall(_ws_frame(header))
+            got = b""
+            first = None
+            while True:
+                opcode, chunk = _ws_read(ws, timeout)
+                if opcode is None:
+                    break
+                if first is None:
+                    first = time.time() - t0
+                got += chunk
+                if len(got) > 60:
+                    break
+            latency = round((first if first is not None else (time.time() - t0)) * 1000)
+            status_line = got.split(b"\r\n")[0] if got else b""
+            if b"204" in status_line:
+                return True, latency, ""
+            last_err = f"bad:{status_line[:32].decode('latin1', 'replace') or 'empty'}"
+            if status_line:
+                return False, latency, last_err
+        except Exception as exc:
+            last_err = f"{type(exc).__name__}"
+        finally:
+            try:
+                sock.close()
+            except Exception:
+                pass
+    return False, 0, last_err
+
+
+def probe_lines(items):
+    """items: [(line, entry, node)] — 原位写入 probe_ok/probe_ms/probe_error, 返回通过的 line"""
+    def task(item):
+        line, entry, node = item
+        ok, ms, err = _probe_one(entry, node["host"], node["port"])
+        return node, ok, ms, err
+
+    with ThreadPoolExecutor(max_workers=PROBE_CONCURRENCY) as pool:
+        futures = [pool.submit(task, it) for it in items]
+        for fut in as_completed(futures):
+            node, ok, ms, err = fut.result()
+            node["probe_ok"] = ok
+            node["probe_ms"] = ms or None
+            if ok:
+                node.pop("probe_error", None)
+            else:
+                node["probe_error"] = err
+
+    return [line for line, _entry, node in items if node.get("probe_ok")]
+
+
+def drop_probed_failures(data):
+    """从 data 中剔除拨测失败的节点并重算统计"""
+    keep = [n for n in data.get("available", []) if n.get("probe_ok")]
+    dropped = len(data.get("available", [])) - len(keep)
+    if not dropped:
+        return 0
+    data["available"] = keep
+    for cname in list(data["countries"].keys()):
+        grp = data["countries"][cname]
+        grp["nodes"] = [n for n in grp["nodes"] if n.get("probe_ok")]
+        if not grp["nodes"]:
+            del data["countries"][cname]
+            continue
+        grp["count"] = len(grp["nodes"])
+        grp["residential"] = sum(1 for n in grp["nodes"] if n.get("residential") == "residential")
+        grp["datacenter"] = sum(1 for n in grp["nodes"] if n.get("residential") == "datacenter")
+    st = data["stats"]
+    st["success"] = len(keep)
+    st["failed"] = max(0, int(st.get("checked") or 0) - len(keep))
+    st["countries"] = len(data["countries"])
+    st["residential_est"] = sum(1 for n in keep if n.get("residential") == "residential")
+    st["datacenter_est"] = sum(1 for n in keep if n.get("residential") == "datacenter")
+    st["probe_dropped"] = dropped
+    return dropped
 
 # ---------------------------------------------------------------------------
 # main
@@ -393,6 +594,20 @@ def main():
 
     data = build_outputs(results, raw_count, sstp_count, source)
     log("RESULT", f"可用节点: {len(success)}")
+
+    if PROBE_ENABLE and PROBE_UUID:
+        items = list(iter_node_lines(data))
+        log("PROBE", f"端到端拨测: {len(items)} (并发 {PROBE_CONCURRENCY}, 超时 {PROBE_TIMEOUT}s, 目标 {PROBE_TARGET_HOST}:{PROBE_TARGET_PORT})")
+        t1 = time.time()
+        kept = probe_lines(items)
+        log("PROBE", f"拨测通过: {len(kept)}  剔除: {len(items) - len(kept)}  耗时: {time.time() - t1:.1f}s")
+        if items and not kept:
+            die("端到端拨测全部失败 — 入口或 Worker 链路异常, 本次运行判定失败 (不生成空结果)")
+        dropped = drop_probed_failures(data)
+        if dropped:
+            log("PROBE", f"已从结果中剔除 {dropped} 个拨不通节点")
+    else:
+        log("PROBE", "跳过端到端拨测 (PROBE_UUID 未配置)")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
     data_path, html_path, nodes_path = write_outputs(data)

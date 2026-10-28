@@ -13,7 +13,7 @@ concurrency:
 jobs:
   check:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -27,6 +27,15 @@ jobs:
           CHECK_WORKER: "https://check.sosojhmm.biz/check?sstp=vpn:vpn@"
           CHECK_CONCURRENCY: "32"
           CHECK_TIMEOUT: "90"
+          # 端到端拨测: 真实客户端路径 (VLESS over WS -> Worker -> SSTP -> 204)
+          PROBE_ENABLE: "1"
+          PROBE_HOST: "edt.sosojhmm.biz"
+          PROBE_UUID: ${{ secrets.PROBE_UUID }}
+          PROBE_CONCURRENCY: "10"
+          PROBE_TIMEOUT: "8"
+          PROBE_TARGET_HOST: "cp.cloudflare.com"
+          PROBE_TARGET_PORT: "80"
+          PROBE_TARGET_PATH: "/generate_204"
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
