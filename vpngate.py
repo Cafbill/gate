@@ -469,8 +469,9 @@ def _probe_one(entry, exit_host, exit_port, timeout=None):
                 if not chunk:
                     break
                 buf += chunk
-            if b" 101" not in buf.split(b"\r\n")[0]:
-                last_err = f"ws:{buf.split(b'\r\n')[0][:40].decode('latin1', 'replace')}"
+            status_line = buf.split(b"\r\n")[0][:60].decode("latin1", "replace")
+            if " 101" not in status_line:
+                last_err = "ws:" + status_line
                 continue
             t_ws = time.time() - t0
             header = (
