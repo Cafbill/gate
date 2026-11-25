@@ -37,7 +37,7 @@ jobs:
           PROBE_TARGET_PORT: "80"
           PROBE_TARGET_PATH: "/generate_204"
       - uses: actions/configure-pages@v5
-      - uses: actions/upload-pages-artifact@v3
+      - uses: actions/upload-pages-artifact@v4
         with:
           path: 'public'
-      - uses: actions/deploy-pages@v4
+      - uses: actions/deploy-pages@v5
