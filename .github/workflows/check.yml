@@ -40,4 +40,12 @@ jobs:
       - uses: actions/upload-pages-artifact@v4
         with:
           path: 'public'
-      - uses: actions/deploy-pages@v5
+  deploy:
+    needs: check
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
